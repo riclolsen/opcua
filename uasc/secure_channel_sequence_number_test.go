@@ -255,11 +255,20 @@ type sequenceNumberPeer struct {
 // write sends one final MSG chunk carrying the given SequenceNumber, signed
 // and encrypted with algo when the mode asks for it.
 func (p *sequenceNumberPeer) write(t *testing.T, seq, reqID uint32, policyURI string, mode ua.MessageSecurityMode, algo *uapolicy.EncryptionAlgorithm) {
+	p.writeAs(t, ChunkTypeFinal, seq, reqID, policyURI, mode, algo)
+}
+
+// writeChunk sends one unsecured MSG chunk of the given chunk type.
+func (p *sequenceNumberPeer) writeChunk(t *testing.T, chunkType byte, seq, reqID uint32) {
+	p.writeAs(t, chunkType, seq, reqID, ua.SecurityPolicyURINone, ua.MessageSecurityModeNone, nil)
+}
+
+func (p *sequenceNumberPeer) writeAs(t *testing.T, chunkType byte, seq, reqID uint32, policyURI string, mode ua.MessageSecurityMode, algo *uapolicy.EncryptionAlgorithm) {
 	t.Helper()
 
 	m := &Message{
 		MessageHeader: &MessageHeader{
-			Header:                  NewHeader(MessageTypeMessage, ChunkTypeFinal, 1),
+			Header:                  NewHeader(MessageTypeMessage, chunkType, 1),
 			SymmetricSecurityHeader: NewSymmetricSecurityHeader(2),
 			SequenceHeader:          NewSequenceHeader(seq, reqID),
 		},
@@ -279,6 +288,8 @@ func (p *sequenceNumberPeer) write(t *testing.T, seq, reqID uint32, policyURI st
 	require.Len(t, chunks, 1)
 
 	b := chunks[0]
+	// EncodeChunks marks the last chunk final; mark it as asked.
+	b[3] = chunkType
 	if mode != ua.MessageSecurityModeNone {
 		signer := &channelInstance{
 			sc:   &SecureChannel{cfg: &Config{SecurityMode: mode, SecurityPolicyURI: policyURI}},

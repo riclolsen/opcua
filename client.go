@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"reflect"
 	"sort"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/gopcua/opcua/debug"
 	"github.com/gopcua/opcua/errors"
 	"github.com/gopcua/opcua/id"
+	"github.com/gopcua/opcua/secevent"
 	"github.com/gopcua/opcua/stats"
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uacp"
@@ -157,6 +159,9 @@ type Client struct {
 	// the same reason; the connection was the one shared field left plain.
 	atomicConn atomic.Value // *uacp.Conn
 
+	// macs remembers the server's MAC address across reconnects.
+	macs *secevent.MACTracker
+
 	// sechan is the open secure channel.
 	atomicSechan atomic.Value // *uasc.SecureChannel
 	sechanErr    chan error
@@ -246,6 +251,7 @@ func NewClient(endpoint string, opts ...Option) (*Client, error) {
 		wakech:      make(chan struct{}, 1),
 		stateCh:     cfg.stateCh,
 		stateFunc:   cfg.stateFunc,
+		macs:        secevent.NewMACTracker(),
 	}
 	c.pauseSubscriptions(context.Background())
 	c.publishFunc = c.publish
@@ -648,7 +654,14 @@ func (c *Client) Dial(ctx context.Context) error {
 	}
 
 	var err error
-	conn, err := c.cfg.dialer.Dial(ctx, c.endpointURL)
+	dialer := c.cfg.dialer
+	if c.cfg.events != nil && dialer.Events == nil {
+		d := *dialer
+		d.Events = c.cfg.events
+		d.MACs = c.macs
+		dialer = &d
+	}
+	conn, err := dialer.Dial(ctx, c.endpointURL)
 	c.setConn(conn)
 	if err != nil {
 		return err
@@ -739,6 +752,17 @@ func (c *Client) publishTimeout() time.Duration {
 
 func (c *Client) setPublishTimeout(d time.Duration) {
 	c.atomicPublishTimeout.Store(d)
+}
+
+// RemoteMAC returns the MAC address of the server, when it is on a directly
+// attached network and the platform can look it up (see
+// secevent.LookupMAC). It fails when the client is not connected.
+func (c *Client) RemoteMAC() (net.HardwareAddr, error) {
+	conn := c.conn()
+	if conn == nil {
+		return nil, errors.Errorf("opcua: not connected")
+	}
+	return conn.RemoteMAC()
 }
 
 // conn returns the active connection, or nil when none is open.

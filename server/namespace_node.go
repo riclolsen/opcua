@@ -277,6 +277,10 @@ func (as *NodeNameSpace) SetAttribute(id *ua.NodeID, attr ua.AttributeID, val *u
 		return ua.StatusBadUserAccessDenied
 	}
 
+	if attr == ua.AttributeIDValue && !valueMatchesDataType(n, val) {
+		return ua.StatusBadTypeMismatch
+	}
+
 	err := n.SetAttribute(attr, val)
 	if err != nil {
 		return ua.StatusBadAttributeIDInvalid
@@ -288,4 +292,39 @@ func (as *NodeNameSpace) SetAttribute(id *ua.NodeID, attr ua.AttributeID, val *u
 	}
 
 	return ua.StatusOK
+}
+
+// valueMatchesDataType reports whether val may be written to the Value of n
+// as far as the built-in type goes (OPC 10000-4 §5.10.4: Bad_TypeMismatch
+// "The value supplied for the attribute is not of the same type as the
+// attribute's value"). Only a DataType attribute naming a concrete built-in
+// type of namespace 0 is checked: abstract types (BaseDataType, Number,
+// Integer, ...), enumerations, structures and the absence of a DataType
+// accept any value, and so does a null value.
+func valueMatchesDataType(n *Node, val *ua.DataValue) bool {
+	if val == nil || val.Value == nil || val.Value.Type() == 0 {
+		return true
+	}
+	dv := n.attr[ua.AttributeIDDataType]
+	if dv == nil || dv.Value == nil {
+		return true
+	}
+	var dt *ua.NodeID
+	switch v := dv.Value.Value().(type) {
+	case *ua.NodeID:
+		dt = v
+	case *ua.ExpandedNodeID:
+		dt = v.NodeID
+	}
+	if dt == nil || dt.Namespace() != 0 || dt.Type() != ua.NodeIDTypeTwoByte && dt.Type() != ua.NodeIDTypeFourByte && dt.Type() != ua.NodeIDTypeNumeric {
+		return true
+	}
+	// The ids of the built-in DataTypes equal their TypeIDs, from Boolean
+	// (1) to DiagnosticInfo (25); 24 is BaseDataType, which takes any
+	// value.
+	t := dt.IntID()
+	if t < 1 || t > 25 || t == 24 {
+		return true
+	}
+	return uint32(val.Value.Type()) == t
 }

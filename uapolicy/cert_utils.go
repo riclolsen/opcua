@@ -54,5 +54,9 @@ func PublicKey(c []byte) (*rsa.PublicKey, error) {
 		return nil, err
 	}
 
-	return cert.PublicKey.(*rsa.PublicKey), nil
+	key, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("uapolicy: certificate has a %T, not an RSA public key", cert.PublicKey)
+	}
+	return key, nil
 }

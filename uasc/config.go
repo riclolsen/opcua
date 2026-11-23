@@ -6,8 +6,10 @@ package uasc
 
 import (
 	"crypto/rsa"
+	"crypto/x509"
 	"time"
 
+	"github.com/gopcua/opcua/secevent"
 	"github.com/gopcua/opcua/ua"
 )
 
@@ -89,7 +91,27 @@ type Config struct {
 	// recommends. Some servers close the connection when they receive a null
 	// ClientNonce. See https://github.com/gopcua/opcua/issues/894.
 	ForceNonEmptyNonce bool
+
+	// VerifyRemoteCertificate, if set, is called with the peer's
+	// certificate from the first OpenSecureChannel message of a secure
+	// channel, before it is used. A non-nil error rejects the certificate:
+	// the channel fails with Bad_CertificateUntrusted and a
+	// secevent.CertificateRejected event is reported. Use it to check the
+	// certificate against a trust list, its validity period, or its
+	// ApplicationUri.
+	VerifyRemoteCertificate func(cert *x509.Certificate) error
+
+	// RenewRateLimit is the rate of OpenSecureChannel requests on one
+	// secure channel above which a server reports a secevent.RenewStorm,
+	// and, if Enforce is set, refuses the request. The zero value selects
+	// DefaultRenewRateLimit.
+	RenewRateLimit secevent.RateLimit
 }
+
+// DefaultRenewRateLimit is the RenewRateLimit used when a Config has none:
+// a client renews its token at 75% of its lifetime, so more than ten
+// renewals a minute is far beyond any sane lifetime.
+var DefaultRenewRateLimit = secevent.RateLimit{Max: 10, Window: time.Minute}
 
 // SessionConfig is a set of common configurations used in Session.
 type SessionConfig struct {

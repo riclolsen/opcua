@@ -281,6 +281,11 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 		b = append(b[:headerLength], p...)
 	}
 
+	// A chunk too short for its headers and signature, or with a padding
+	// length beyond its body, would make the slicing below panic.
+	if len(b) < headerLength+c.algo.RemoteSignatureLength() {
+		return nil, ua.StatusBadSecurityChecksFailed
+	}
 	signature := b[len(b)-c.algo.RemoteSignatureLength():]
 	messageToVerify := b[:len(b)-c.algo.RemoteSignatureLength()]
 
@@ -299,6 +304,9 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 		paddingLength += 1
 	}
 
+	if paddingLength < 0 || headerLength > len(messageToVerify)-paddingLength {
+		return nil, ua.StatusBadSecurityChecksFailed
+	}
 	b = messageToVerify[headerLength : len(messageToVerify)-paddingLength]
 
 	return b, nil

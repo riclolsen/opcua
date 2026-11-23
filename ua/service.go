@@ -42,7 +42,7 @@ func DecodeService(b []byte) (*ExpandedNodeID, interface{}, error) {
 
 	v := svcreg.New(typeID.NodeID)
 	if v == nil {
-		return nil, nil, StatusBadServiceUnsupported
+		return typeID, nil, StatusBadServiceUnsupported
 	}
 
 	if debug.FlagSet("packet") {

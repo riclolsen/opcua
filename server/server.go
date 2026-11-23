@@ -10,7 +10,6 @@ import (
 	"encoding/xml"
 	"fmt"
 	"log"
-	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/schema"
+	"github.com/gopcua/opcua/secevent"
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uapolicy"
@@ -50,6 +50,11 @@ type Server struct {
 
 	SubscriptionService  *SubscriptionService
 	MonitoredItemService *MonitoredItemService
+
+	// reqRate and scanRate count requests and operations on unknown
+	// nodes per secure channel, for flood and scan detection.
+	reqRate  *secevent.Counter
+	scanRate *secevent.Counter
 }
 
 type serverConfig struct {
@@ -70,6 +75,8 @@ type serverConfig struct {
 	cap ServerCapabilities
 
 	logger Logger
+
+	sec securityConfig
 }
 
 var capabilities = ServerCapabilities{
@@ -104,6 +111,10 @@ func New(opts ...Option) *Server {
 		manufacturerName: "The gopcua Team",      // override with the ManufacturerName option
 		productName:      "gopcua OPC/UA Server", // override with the ProductName option
 		softwareVersion:  "0.0.0-dev",            // override with the SoftwareVersion option
+		sec: securityConfig{
+			reqRate:  DefaultRequestRateLimit,
+			scanRate: DefaultAddressScanLimit,
+		},
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -119,6 +130,8 @@ func New(opts ...Option) *Server {
 		cb:       newChannelBroker(cfg.logger),
 		sb:       newSessionBroker(cfg.logger),
 		handlers: make(map[uint16]Handler),
+		reqRate:  secevent.NewCounter(cfg.sec.reqRate),
+		scanRate: secevent.NewCounter(cfg.sec.scanRate),
 		namespaces: []NameSpace{
 			NewNameSpace("http://opcfoundation.org/UA/"), // ns:0
 		},
@@ -252,7 +265,8 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.url == "" {
 		s.url = defaultListenAddr
 	}
-	s.l, err = uacp.Listen(ctx, s.url, nil)
+	listenOpts := append([]uacp.ListenOption{uacp.WithEventHandler(s.cfg.sec.events)}, s.cfg.sec.listen...)
+	s.l, err = uacp.Listen(ctx, s.url, nil, listenOpts...)
 	if err != nil {
 		return err
 	}
@@ -264,6 +278,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cb == nil {
 		s.cb = newChannelBroker(s.cfg.logger)
 	}
+	s.cb.configure = s.configureChannel
 
 	go s.acceptAndRegister(ctx, s.l)
 	go s.monitorConnections(ctx)
@@ -301,25 +316,21 @@ func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
 		case <-ctx.Done():
 			return
 		default:
+			// Accept returns an error only when the listener fails or
+			// ctx ends: a client that fails the handshake is handled,
+			// and reported, by the listener.
 			c, err := l.Accept(ctx)
 			if err != nil {
-				switch x := err.(type) {
-				case *net.OpError:
-					// socket closed. Cannot recover from this.
-					if s.cfg.logger != nil {
-						s.cfg.logger.Error("socket closed: %s", err)
-					}
+				if ctx.Err() != nil {
 					return
-				case temporary:
-					if x.Temporary() {
-						continue
-					}
-				default:
-					if s.cfg.logger != nil {
-						s.cfg.logger.Error("error accepting connection: %s", err)
-					}
+				}
+				if x, ok := err.(temporary); ok && x.Temporary() {
 					continue
 				}
+				if s.cfg.logger != nil {
+					s.cfg.logger.Error("socket closed: %s", err)
+				}
+				return
 			}
 
 			go s.cb.RegisterConn(ctx, c, s.cfg.certificate, s.cfg.privateKey)
@@ -344,28 +355,32 @@ func (s *Server) monitorConnections(ctx context.Context) {
 			}
 			continue // todo(fs): close SC???
 		}
+		s.cb.mu.RLock()
+		sc, ok := s.cb.s[msg.SecureChannelID]
+		s.cb.mu.RUnlock()
 		if resp := msg.Response(); resp != nil {
 			if s.cfg.logger != nil {
 				s.cfg.logger.Error("monitorConnections: Server received response %T ???", resp)
 			}
+			s.emit(sc, secevent.Event{Kind: secevent.UnsolicitedResponse, Severity: secevent.Warning, SecureChannelID: msg.SecureChannelID, RequestID: msg.RequestID, Service: secevent.ServiceName(resp), Detail: "server received a response"})
 			continue // todo(fs): close SC???
 		}
 		if s.cfg.logger != nil {
 			s.cfg.logger.Debug("monitorConnections: Received Message: %T", msg.Request())
 		}
-		s.cb.mu.RLock()
-		sc, ok := s.cb.s[msg.SecureChannelID]
-		s.cb.mu.RUnlock()
 		if !ok {
 			// if the secure channel ID is 0, this is probably a open secure channel request.
 			if s.cfg.logger != nil && msg.SecureChannelID != 0 {
 				s.cfg.logger.Error("monitorConnections: Unknown SecureChannel: %d", msg.SecureChannelID)
 			}
+			if msg.SecureChannelID != 0 {
+				s.emit(nil, secevent.Event{Kind: secevent.UnknownChannel, Severity: secevent.Warning, SecureChannelID: msg.SecureChannelID, RequestID: msg.RequestID, Service: secevent.ServiceName(msg.Request()), Status: ua.StatusBadSecureChannelIDInvalid, Detail: "request for an unknown secure channel"})
+			}
 			continue
 		}
 
 		// todo: should this be delegated to another goroutine in case handling this hangs?
-		s.handleService(ctx, sc, msg.RequestID, msg.Request())
+		s.handleService(ctx, sc, msg.SecureChannelID, msg.RequestID, msg.Request())
 	}
 }
 

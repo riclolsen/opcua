@@ -2,11 +2,14 @@ package server
 
 import (
 	"crypto/rand"
+	"fmt"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/gopcua/opcua/secevent"
 	"github.com/gopcua/opcua/ua"
+	"github.com/gopcua/opcua/uapolicy"
 	"github.com/gopcua/opcua/uasc"
 )
 
@@ -36,14 +39,45 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		return nil, err
 	}
 
-	// New session
-	sess := s.srv.sb.NewSession()
+	if max := s.srv.cfg.sec.maxSessions; max > 0 && s.srv.sb.Count() >= max {
+		s.srv.emit(sc, secevent.Event{
+			Kind:      secevent.SessionLimit,
+			Severity:  secevent.Alert,
+			RequestID: reqID,
+			Service:   "CreateSessionRequest",
+			Status:    ua.StatusBadTooManySessions,
+			Detail:    fmt.Sprintf("%d sessions, the maximum", max),
+		})
+		return nil, ua.StatusBadTooManySessions
+	}
+
+	if verify := s.srv.cfg.sec.verifyCert; verify != nil && len(req.ClientCertificate) > 0 {
+		cert, err := uapolicy.ParseCertificate(req.ClientCertificate)
+		if err == nil {
+			err = verify(cert)
+		}
+		if err != nil {
+			s.srv.emit(sc, secevent.Event{
+				Kind:      secevent.CertificateRejected,
+				Severity:  secevent.Alert,
+				RequestID: reqID,
+				Service:   "CreateSessionRequest",
+				Status:    ua.StatusBadCertificateUntrusted,
+				Detail:    "client certificate of CreateSession rejected",
+				Err:       err,
+			})
+			return nil, ua.StatusBadCertificateUntrusted
+		}
+	}
 
 	// Ensure session timeout is reasonable
-	sess.cfg.sessionTimeout = time.Duration(req.RequestedSessionTimeout) * time.Millisecond
-	if sess.cfg.sessionTimeout > sessionTimeoutMax || sess.cfg.sessionTimeout < sessionTimeoutMin {
-		sess.cfg.sessionTimeout = sessionTimeoutDefault
+	timeout := time.Duration(req.RequestedSessionTimeout) * time.Millisecond
+	if timeout > sessionTimeoutMax || timeout < sessionTimeoutMin {
+		timeout = sessionTimeoutDefault
 	}
+
+	// New session
+	sess := s.srv.sb.NewSession(timeout)
 
 	nonce := make([]byte, sessionNonceLength)
 	if _, err := rand.Read(nonce); err != nil {
@@ -56,7 +90,17 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 	sig, alg, err := sc.NewSessionSignature(req.ClientCertificate, req.ClientNonce)
 	if err != nil {
 		log.Printf("error creating session signature")
-		return nil, ua.StatusBadInternalError
+		s.srv.sb.Close(sess.AuthTokenID)
+		s.srv.emit(sc, secevent.Event{
+			Kind:      secevent.CertificateRejected,
+			Severity:  secevent.Alert,
+			RequestID: reqID,
+			Service:   "CreateSessionRequest",
+			Status:    ua.StatusBadCertificateInvalid,
+			Detail:    "cannot sign with the client certificate of CreateSession",
+			Err:       err,
+		})
+		return nil, ua.StatusBadCertificateInvalid
 	}
 
 	matching_endpoints := make([]*ua.EndpointDescription, 0)

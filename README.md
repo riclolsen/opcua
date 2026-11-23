@@ -188,6 +188,27 @@ The current focus is on the OPC UA Binary protocol over TCP. No other protocols 
 |                | User Name Password               | Yes       |             |
 |                | X509 Certificate                 | Yes       |             |
 
+## Security Events
+
+Package [`secevent`](secevent) reports security relevant protocol events to a
+callback, for an intrusion detection system, a SIEM or an operator. Pass a
+handler with `server.SecurityEventHandler` or `opcua.SecurityEventHandler`;
+wrap a slow one with `secevent.Async`. Every event carries the peer's address,
+its MAC address when it is on a directly attached network (Linux, from the
+ARP/NDP neighbor table), the connection and secure channel ids and, where it
+applies, the service, node and status code.
+
+| Layer      | Events |
+|------------|--------|
+| Connection | every accepted connection, peers outside `AllowedPeers`, connection limits and exhaustion (`MaxConnections`, pending handshakes, out of file descriptors), connection floods, failed or timed out handshakes (port scans, silent peers), a changed MAC address for the same IP, ReverseHello |
+| Message    | malformed headers, message and chunk types, oversized messages and chunk floods, SequenceNumber errors (replay), failed signatures, unknown SecureChannelId or TokenId, rejected and changed certificates, security policy or mode downgrades on renewal, renewal storms, unsolicited responses |
+| Service    | reads, writes, browses and monitored items on unknown nodes, address space scans, reads beyond `MaxNodesPerRead`, writes of the wrong data type, access denied, unsupported services and unknown methods, rejected requests, request floods, unknown sessions, failed session activation, the session limit, and audit events for writes (parameter changes), method calls (with Alert severity for server state changes, program control, file transfer and security configuration), node management and rarely used services |
+
+Thresholds are reported by default and enforced when a `secevent.RateLimit`
+sets `Enforce`. `uacp.Conn.RemoteMAC`, `uasc.SecureChannel.RemoteMAC` and
+`Client.RemoteMAC` expose the peer's MAC address. See
+[examples/secevents](examples/secevents).
+
 ## Supported Server Features
 
 The current focus is on the OPC UA Binary protocol over TCP. No other protocols are supported at this point.

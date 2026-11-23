@@ -5,10 +5,13 @@
 package uasc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -19,6 +22,7 @@ import (
 
 	"github.com/gopcua/opcua/debug"
 	"github.com/gopcua/opcua/errors"
+	"github.com/gopcua/opcua/secevent"
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uapolicy"
@@ -210,6 +214,9 @@ type SecureChannel struct {
 	// chunks maintains a temporary list of chunks for a given request ID
 	chunks   map[uint32][]*MessageChunk
 	chunksMu sync.Mutex
+	// chunkCount and chunkBytes account for all chunks in chunks.
+	chunkCount int
+	chunkBytes uint64
 
 	// recvSequence is the SequenceNumber of the last received chunk, whatever
 	// TokenId secured it (OPC 10000-6 §6.7.2.4: the SequenceNumber "does not
@@ -254,6 +261,14 @@ type SecureChannel struct {
 	// kind indicates whether this is a server or a client channel.
 	kind channelKind
 
+	// remoteLeaf is the DER of the peer's leaf certificate, pinned by the
+	// first OpenSecureChannel message: a renewal must not change it.
+	// Only the dispatcher goroutine reads and writes it.
+	remoteLeaf []byte
+
+	// opnRate counts the OpenSecureChannel requests a server receives.
+	opnRate *secevent.Counter
+
 	closeOnce sync.Once
 }
 
@@ -297,7 +312,13 @@ func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKi
 		return nil, errors.Errorf("invalid channel config: Security policy '%s' requires a private key", cfg.SecurityPolicyURI)
 	}
 
+	renewLimit := cfg.RenewRateLimit
+	if !renewLimit.Enabled() {
+		renewLimit = DefaultRenewRateLimit
+	}
+
 	s := &SecureChannel{
+		opnRate:     secevent.NewCounter(renewLimit),
 		endpointURL: endpoint,
 		c:           c,
 		cfg:         cfg,
@@ -321,6 +342,46 @@ func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKi
 
 func (s *SecureChannel) RemoteAddr() net.Addr {
 	return s.c.TCPConn.RemoteAddr()
+}
+
+// RemoteMAC returns the MAC address of the peer. See uacp.Conn.RemoteMAC.
+func (s *SecureChannel) RemoteMAC() (net.HardwareAddr, error) {
+	return s.c.RemoteMAC()
+}
+
+// Conn returns the connection of the secure channel.
+func (s *SecureChannel) Conn() *uacp.Conn {
+	return s.c
+}
+
+// Emit reports a security event of the secure channel, filling in its
+// SecureChannelID and the connection details. It is a no-op when the
+// connection has no event handler.
+func (s *SecureChannel) Emit(e secevent.Event) {
+	if s.c.EventHandler() == nil {
+		return
+	}
+	if e.SecureChannelID == 0 {
+		e.SecureChannelID = s.channelID()
+	}
+	s.c.Emit(e)
+}
+
+// channelID returns the SecureChannelID of the active, or else the opening,
+// instance.
+func (s *SecureChannel) channelID() uint32 {
+	s.instancesMu.Lock()
+	defer s.instancesMu.Unlock()
+	if s.activeInstance != nil {
+		return s.activeInstance.secureChannelID
+	}
+	return 0
+}
+
+func (s *SecureChannel) hasActiveInstance() bool {
+	s.instancesMu.Lock()
+	defer s.instancesMu.Unlock()
+	return s.activeInstance != nil
 }
 
 func (s *SecureChannel) getActiveChannelInstance() (*channelInstance, error) {
@@ -372,6 +433,17 @@ func (s *SecureChannel) dispatcher() {
 
 			if !ok {
 				debug.Printf("uasc %d/%d: no handler for %T", s.c.ID(), msg.RequestID, msg.body)
+				if resp := msg.Response(); resp != nil {
+					// Either the peer answers a request that was
+					// never sent, or one that already timed out.
+					s.Emit(secevent.Event{
+						Kind:      secevent.UnsolicitedResponse,
+						Severity:  secevent.Warning,
+						RequestID: msg.RequestID,
+						Service:   secevent.ServiceName(resp),
+						Detail:    "response matches no pending request (unsolicited or late)",
+					})
+				}
 				continue
 			}
 
@@ -432,12 +504,13 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 
 			switch hdr.ChunkType {
 			case 'A':
-				delete(s.chunks, reqID)
+				s.dropChunks(reqID)
 				s.chunksMu.Unlock()
 
 				msga := new(MessageAbort)
 				if _, err := msga.Decode(chunk.Data); err != nil {
 					debug.Printf("uasc %d/%d: invalid MSGA chunk. %s", s.c.ID(), reqID, err)
+					s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadDecodingError, Detail: "invalid abort chunk", Err: err})
 					msg.Err = ua.StatusBadDecodingError
 					return msg
 				}
@@ -445,31 +518,67 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 				return &MessageBody{RequestID: reqID, Err: ua.StatusCode(msga.ErrorCode)}
 
 			case 'C':
+				// The chunk's data is a slice of a buffer sized for a
+				// whole receive buffer; copy it so that what is retained
+				// is what is counted.
+				chunk.Data = append([]byte(nil), chunk.Data...)
 				s.chunks[reqID] = append(s.chunks[reqID], chunk)
+				s.chunkCount++
+				s.chunkBytes += uint64(len(chunk.Data))
 				if n := len(s.chunks[reqID]); uint32(n) > s.c.MaxChunkCount() {
-					delete(s.chunks, reqID)
+					s.dropChunks(reqID)
 					s.chunksMu.Unlock()
 					msg.Err = errors.Errorf("too many chunks: %d > %d", n, s.c.MaxChunkCount())
+					s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "too many chunks", Err: msg.Err})
+					return msg
+				}
+				// Bound what all partial messages together hold, not
+				// only each one: a peer that starts many messages and
+				// never finishes them would otherwise hold MaxChunkCount
+				// chunks for every RequestId it invents.
+				if max := s.c.MaxChunkCount(); max > 0 && uint64(s.chunkCount) > uint64(max) {
+					n := s.chunkCount
+					s.dropChunks(reqID)
+					s.chunksMu.Unlock()
+					msg.Err = errors.Errorf("too many buffered chunks: %d > %d", n, max)
+					s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "buffered partial messages exceed the maximum chunk count", Err: msg.Err})
+					return msg
+				}
+				if max := s.c.MaxMessageSize(); max > 0 && s.chunkBytes > uint64(max) {
+					n := s.chunkBytes
+					s.dropChunks(reqID)
+					s.chunksMu.Unlock()
+					msg.Err = errors.Errorf("partial messages too large: %d > %d", n, max)
+					s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "buffered partial messages exceed the maximum message size", Err: msg.Err})
 					return msg
 				}
 				s.chunksMu.Unlock()
 				continue
+
+			case 'F':
+			default:
+				s.chunksMu.Unlock()
+				msg.Err = errors.Errorf("sechan: invalid chunk type %q: %w", hdr.ChunkType, ua.StatusBadTCPMessageTypeInvalid)
+				s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadTCPMessageTypeInvalid, Detail: "invalid chunk type", Err: msg.Err})
+				return msg
 			}
 
 			// merge chunks
 			all := append(s.chunks[reqID], chunk)
-			delete(s.chunks, reqID)
+			s.dropChunks(reqID)
 
 			s.chunksMu.Unlock()
 
 			b, err := mergeChunks(all)
 			if err != nil {
 				msg.Err = err
+				s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, RequestID: reqID, Detail: "cannot merge chunks", Err: err})
 				return msg
 			}
 
 			if uint32(len(b)) > s.c.MaxMessageSize() {
 				msg.Err = errors.Errorf("message too large: %d > %d", uint32(len(b)), s.c.MaxMessageSize())
+				s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "message exceeds the maximum message size", Err: msg.Err})
 				return msg
 			}
 
@@ -483,9 +592,17 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 			// and subsequently remove it and the TypeID from all service
 			// structs and tests. We also need to add a deadline to all
 			// handlers and check them periodically to time them out.
-			_, body, err := ua.DecodeService(b)
+			typeID, body, err := ua.DecodeService(b)
 			if err != nil {
 				msg.Err = err
+				ev := secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadDecodingError, Detail: "cannot decode service", Err: err}
+				if errors.Is(err, ua.StatusBadServiceUnsupported) {
+					ev.Kind, ev.Status, ev.Detail = secevent.UnknownCommand, ua.StatusBadServiceUnsupported, "unknown service type"
+					if typeID != nil {
+						ev.NodeID = typeID.NodeID
+					}
+				}
+				s.Emit(ev)
 				return msg
 			}
 
@@ -534,15 +651,24 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	}
 
 	const hdrlen = 12 // TODO: move to pkg level const
+	if len(b) < hdrlen {
+		err := errors.Errorf("sechan: message of %d bytes is shorter than its header", len(b))
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Detail: "truncated secure conversation header", Err: err})
+		return nil, err
+	}
 	h := new(Header)
 	if _, err := h.Decode(b[:hdrlen]); err != nil {
-		return nil, errors.Errorf("sechan: decode header failed: %s", err)
+		err = errors.Errorf("sechan: decode header failed: %s", err)
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Detail: "invalid secure conversation header", Err: err})
+		return nil, err
 	}
 
 	// decode the other headers
 	m := new(MessageChunk)
 	if _, err := m.Decode(b); err != nil {
-		return nil, errors.Errorf("sechan: decode chunk failed: %s", err)
+		err = errors.Errorf("sechan: decode chunk failed: %s", err)
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, SecureChannelID: h.SecureChannelID, Detail: "invalid security header", Err: err})
+		return nil, err
 	}
 
 	var decryptWith *channelInstance
@@ -551,6 +677,7 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	case "OPN":
 		// Make sure we have a valid security header
 		if m.AsymmetricSecurityHeader == nil {
+			s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, SecureChannelID: h.SecureChannelID, Status: ua.StatusBadDecodingError, Detail: "OpenSecureChannel without asymmetric security header"})
 			return nil, ua.StatusBadDecodingError // todo(dh): check if this is the correct error
 		}
 
@@ -558,9 +685,35 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 			return nil, errors.Errorf("sechan: invalid state. openingInstance is nil.")
 		}
 
+		// A renewal must keep the security policy of the channel
+		// (OPC 10000-6 §6.7.4): a different one would downgrade it.
+		if s.hasActiveInstance() && m.SecurityPolicyURI != s.cfg.SecurityPolicyURI {
+			err := errors.Errorf("sechan: renewal changes the security policy from %s to %s: %w", s.cfg.SecurityPolicyURI, m.SecurityPolicyURI, ua.StatusBadSecurityPolicyRejected)
+			s.Emit(secevent.Event{Kind: secevent.SecurityCheckFailed, Severity: secevent.Alert, SecureChannelID: h.SecureChannelID, Status: ua.StatusBadSecurityPolicyRejected, Detail: "secure channel renewal changes the security policy", Err: err})
+			return nil, err
+		}
+
 		s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
 		if m.SecurityPolicyURI != ua.SecurityPolicyURINone {
-			s.cfg.RemoteCertificate = m.AsymmetricSecurityHeader.SenderCertificate
+			// Validate the sender certificate before it replaces the
+			// configured one: a rejected certificate must leave the
+			// configuration, which a client reuses to reconnect, intact.
+			sender := m.AsymmetricSecurityHeader.SenderCertificate
+			remoteCert, err := uapolicy.ParseCertificate(sender)
+			if err != nil {
+				s.Emit(secevent.Event{Kind: secevent.CertificateRejected, Severity: secevent.Alert, SecureChannelID: h.SecureChannelID, Status: ua.StatusBadCertificateInvalid, Detail: "cannot parse sender certificate", Err: err})
+				return nil, err
+			}
+			remoteKey, ok := remoteCert.PublicKey.(*rsa.PublicKey)
+			if !ok {
+				s.Emit(secevent.Event{Kind: secevent.CertificateRejected, Severity: secevent.Alert, SecureChannelID: h.SecureChannelID, Status: ua.StatusBadCertificateInvalid, Detail: "sender certificate has no RSA public key"})
+				return nil, ua.StatusBadCertificateInvalid
+			}
+			if err := s.checkRemoteCertificate(h.SecureChannelID, remoteCert, s.cfg.RemoteCertificate); err != nil {
+				return nil, err
+			}
+
+			s.cfg.RemoteCertificate = sender
 			// Re-derive the receiver thumbprint from the peer certificate
 			// learned in the inbound OPN. No-op for the client path, where
 			// Thumbprint is already set from the endpoint's ServerCertificate
@@ -570,14 +723,6 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 			}
 			debug.Printf("uasc %d: setting securityPolicy to %s", s.c.ID(), m.SecurityPolicyURI)
 
-			remoteCert, err := uapolicy.ParseCertificate(s.cfg.RemoteCertificate)
-			if err != nil {
-				return nil, err
-			}
-			remoteKey, ok := remoteCert.PublicKey.(*rsa.PublicKey)
-			if !ok {
-				return nil, ua.StatusBadCertificateInvalid
-			}
 			algo, err := uapolicy.Asymmetric(s.cfg.SecurityPolicyURI, s.openingInstance.sc.cfg.LocalKey, remoteKey)
 			if err != nil {
 				return nil, err
@@ -592,7 +737,9 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	case "MSG":
 		// noop
 	default:
-		return nil, errors.Errorf("sechan: unknown message type: %s", m.MessageType)
+		err := errors.Errorf("sechan: unknown message type: %s", m.MessageType)
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, SecureChannelID: h.SecureChannelID, Status: ua.StatusBadTCPMessageTypeInvalid, Detail: "unknown message type", Err: err})
+		return nil, err
 	}
 
 	// Decrypt the block and put data back into m.Data
@@ -603,29 +750,97 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 
 	n, err := m.SequenceHeader.Decode(m.Data)
 	if err != nil {
-		return nil, errors.Errorf("sechan: decode sequence header failed: %s", err)
+		err = errors.Errorf("sechan: decode sequence header failed: %s", err)
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, SecureChannelID: m.SecureChannelID, Detail: "invalid sequence header", Err: err})
+		return nil, err
 	}
 	m.Data = m.Data[n:]
 
 	// OPC 10000-6 §6.7.7: "After the security validation is complete the
 	// receiver shall verify the RequestId and the SequenceNumber."
 	if err := s.verifyReceivedSequenceNumber(m.SecureChannelID, m.SequenceHeader.SequenceNumber); err != nil {
+		s.Emit(secevent.Event{
+			Kind:            secevent.SequenceError,
+			Severity:        secevent.Alert,
+			SecureChannelID: m.SecureChannelID,
+			RequestID:       m.SequenceHeader.RequestID,
+			Status:          ua.StatusBadSequenceNumberInvalid,
+			Detail:          "SequenceNumber is not the successor of the previous one (replayed, dropped or reordered chunk)",
+			Err:             err,
+		})
 		return nil, err
 	}
 
 	return m, nil
 }
 
+// checkRemoteCertificate validates the peer's certificate from an
+// OpenSecureChannel message. The first one is checked against expected,
+// the certificate a client took from the endpoint, and against the
+// configured validator, and then pinned: a renewal must present the same
+// certificate.
+func (s *SecureChannel) checkRemoteCertificate(channelID uint32, cert *x509.Certificate, expected []byte) error {
+	reject := func(status ua.StatusCode, detail string, err error) error {
+		s.Emit(secevent.Event{Kind: secevent.CertificateRejected, Severity: secevent.Alert, SecureChannelID: channelID, Status: status, Detail: detail, Err: err})
+		if err == nil {
+			return status
+		}
+		return errors.Errorf("sechan: %s: %s: %w", detail, err, status)
+	}
+
+	if s.remoteLeaf != nil {
+		if !bytes.Equal(s.remoteLeaf, cert.Raw) {
+			return reject(ua.StatusBadCertificateInvalid, "secure channel renewal presents a different certificate", nil)
+		}
+		return nil
+	}
+
+	if s.kind == client && len(expected) > 0 {
+		// The client encrypted its request for the endpoint's
+		// certificate; a server that answers with another one is not
+		// the server the client chose.
+		if want, err := uapolicy.ParseCertificate(expected); err == nil && !bytes.Equal(want.Raw, cert.Raw) {
+			return reject(ua.StatusBadCertificateInvalid, fmt.Sprintf("server certificate %q differs from the endpoint's %q", cert.Subject, want.Subject), nil)
+		}
+	}
+
+	if s.cfg.VerifyRemoteCertificate != nil {
+		if err := s.cfg.VerifyRemoteCertificate(cert); err != nil {
+			return reject(ua.StatusBadCertificateUntrusted, fmt.Sprintf("certificate %q rejected by validator", cert.Subject), err)
+		}
+	}
+	s.remoteLeaf = cert.Raw
+	return nil
+}
+
 // verifyAndDecrypt verifies and optionally decrypts a message. if `instance` is given, then it will only use that
 // state. Otherwise it will look up states by channel ID and try each.
 func (s *SecureChannel) verifyAndDecrypt(m *MessageChunk, b []byte, instance *channelInstance) ([]byte, error) {
 	if instance != nil {
-		return instance.verifyAndDecrypt(m, b)
+		data, err := instance.verifyAndDecrypt(m, b)
+		if err != nil {
+			s.Emit(secevent.Event{Kind: secevent.SecurityCheckFailed, Severity: secevent.Alert, SecureChannelID: m.MessageHeader.SecureChannelID, Status: ua.StatusBadSecurityChecksFailed, Detail: "OpenSecureChannel signature or encryption does not verify", Err: err})
+		}
+		return data, err
 	}
 
 	instances := s.getInstancesBySecureChannelID(m.MessageHeader.SecureChannelID)
 	if len(instances) == 0 {
-		return nil, errors.Errorf("sechan: unable to find instance for SecureChannelID=%d", m.MessageHeader.SecureChannelID)
+		err := errors.Errorf("sechan: unable to find instance for SecureChannelID=%d", m.MessageHeader.SecureChannelID)
+		s.Emit(secevent.Event{Kind: secevent.UnknownChannel, Severity: secevent.Warning, SecureChannelID: m.MessageHeader.SecureChannelID, Status: ua.StatusBadSecureChannelIDInvalid, Detail: "unknown SecureChannelId", Err: err})
+		return nil, err
+	}
+	if m.SymmetricSecurityHeader != nil {
+		known := false
+		for _, inst := range instances {
+			if inst.securityTokenID == m.SymmetricSecurityHeader.TokenID {
+				known = true
+				break
+			}
+		}
+		if !known {
+			s.Emit(secevent.Event{Kind: secevent.UnknownChannel, Severity: secevent.Warning, SecureChannelID: m.MessageHeader.SecureChannelID, Status: ua.StatusBadSecureChannelTokenUnknown, Detail: fmt.Sprintf("unknown TokenId %d", m.SymmetricSecurityHeader.TokenID)})
+		}
 	}
 
 	var (
@@ -640,6 +855,7 @@ func (s *SecureChannel) verifyAndDecrypt(m *MessageChunk, b []byte, instance *ch
 		debug.Printf("uasc %d: attempting an older channel state...", s.c.ID())
 	}
 
+	s.Emit(secevent.Event{Kind: secevent.SecurityCheckFailed, Severity: secevent.Alert, SecureChannelID: m.MessageHeader.SecureChannelID, Status: ua.StatusBadSecurityChecksFailed, Detail: "message signature or encryption does not verify", Err: err})
 	return nil, err
 }
 
@@ -914,13 +1130,43 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 	// todo(fs): the client protocol version.
 	// todo(fs): how do we get the HELLO.Version here?
 	// if hello.Version != req.ClientProtocolVersion || req.ClientProtocolVersion != 0 {
+	if !ok {
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, RequestID: reqID, Service: secevent.ServiceName(svc), Detail: "OPN message without OpenSecureChannelRequest"})
+		return ua.StatusBadDecodingError
+	}
+
+	if exceeded, first := s.opnRate.Hit("opn", s.timeNow()); exceeded {
+		lim := s.opnRate.Limit()
+		if first {
+			s.Emit(secevent.Event{Kind: secevent.RenewStorm, Severity: secevent.Alert, RequestID: reqID, Service: "OpenSecureChannelRequest", Detail: fmt.Sprintf("more than %d OpenSecureChannel requests in %s", lim.Max, lim.Window)})
+		}
+		if lim.Enforce {
+			return ua.StatusBadTCPServerTooBusy
+		}
+	}
+
 	if req.ClientProtocolVersion != 0 {
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, RequestID: reqID, Service: "OpenSecureChannelRequest", Status: ua.StatusBadProtocolVersionUnsupported, Detail: fmt.Sprintf("ClientProtocolVersion %d", req.ClientProtocolVersion)})
 		return ua.StatusBadProtocolVersionUnsupported
 	}
 
 	// Part 6.7.4: The AuthenticationToken should be nil. ???
 	if req.RequestHeader.AuthenticationToken.IntID() != 0 {
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, RequestID: reqID, Service: "OpenSecureChannelRequest", Status: ua.StatusBadSecureChannelTokenUnknown, Detail: "OpenSecureChannel with an AuthenticationToken"})
 		return ua.StatusBadSecureChannelTokenUnknown
+	}
+
+	// The SecurityMode must fit the policy (OPC 10000-4 §5.5.2: None
+	// goes with None only), and a renewal must keep it: switching to
+	// None would let unsigned messages through.
+	switch {
+	case s.hasActiveInstance() && req.SecurityMode != s.cfg.SecurityMode:
+		s.Emit(secevent.Event{Kind: secevent.SecurityCheckFailed, Severity: secevent.Alert, RequestID: reqID, Service: "OpenSecureChannelRequest", Status: ua.StatusBadSecurityModeRejected, Detail: fmt.Sprintf("secure channel renewal changes the security mode from %s to %s", s.cfg.SecurityMode, req.SecurityMode)})
+		return ua.StatusBadSecurityModeRejected
+	case (s.cfg.SecurityPolicyURI == ua.SecurityPolicyURINone) != (req.SecurityMode == ua.MessageSecurityModeNone),
+		req.SecurityMode != ua.MessageSecurityModeNone && req.SecurityMode != ua.MessageSecurityModeSign && req.SecurityMode != ua.MessageSecurityModeSignAndEncrypt:
+		s.Emit(secevent.Event{Kind: secevent.SecurityCheckFailed, Severity: secevent.Alert, RequestID: reqID, Service: "OpenSecureChannelRequest", Status: ua.StatusBadSecurityModeRejected, Detail: fmt.Sprintf("security mode %s with security policy %s", req.SecurityMode, s.cfg.SecurityPolicyURI)})
+		return ua.StatusBadSecurityModeRejected
 	}
 
 	s.cfg.Lifetime = req.RequestedLifetime
@@ -947,7 +1193,6 @@ func (s *SecureChannel) handleOpenSecureChannelRequest(reqID uint32, svc ua.Requ
 		if err != nil {
 			return err
 		}
-		var ok bool
 		if remoteKey, ok = remoteCert.PublicKey.(*rsa.PublicKey); !ok {
 			return ua.StatusBadCertificateInvalid
 		}
@@ -1434,6 +1679,16 @@ func (s *SecureChannel) timeNow() time.Time {
 		return s.time()
 	}
 	return time.Now()
+}
+
+// dropChunks forgets the buffered chunks of reqID and their accounting.
+// The caller holds chunksMu.
+func (s *SecureChannel) dropChunks(reqID uint32) {
+	for _, c := range s.chunks[reqID] {
+		s.chunkCount--
+		s.chunkBytes -= uint64(len(c.Data))
+	}
+	delete(s.chunks, reqID)
 }
 
 // mergeChunks concatenates the bodies of a message's chunks. Chunks reach it

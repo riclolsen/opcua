@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gopcua/opcua/errors"
+	"github.com/gopcua/opcua/secevent"
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uacp"
 	"github.com/gopcua/opcua/uapolicy"
@@ -62,6 +63,7 @@ type Config struct {
 	session   *uasc.SessionConfig
 	stateCh   chan<- ConnState
 	stateFunc func(ConnState)
+	events    secevent.Handler
 }
 
 func DefaultDialer() *uacp.Dialer {
@@ -613,6 +615,29 @@ func RequestTimeout(t time.Duration) Option {
 func Dialer(d *uacp.Dialer) Option {
 	return func(cfg *Config) error {
 		cfg.dialer = d
+		return nil
+	}
+}
+
+// SecurityEventHandler sets the handler that receives the security events
+// the client detects on its connections: malformed or oversized messages,
+// failed signatures, sequence errors, unexpected or changed server
+// certificates, unsolicited responses, and a change of the MAC address
+// behind the server's IP address across reconnects. See package secevent.
+func SecurityEventHandler(h secevent.Handler) Option {
+	return func(cfg *Config) error {
+		cfg.events = h
+		return nil
+	}
+}
+
+// RemoteCertificateValidator sets a function that checks the server's
+// certificate from its OpenSecureChannel response. A non-nil error rejects
+// the certificate: the connection fails with Bad_CertificateUntrusted and a
+// secevent.CertificateRejected event is reported.
+func RemoteCertificateValidator(f func(*x509.Certificate) error) Option {
+	return func(cfg *Config) error {
+		cfg.sechan.VerifyRemoteCertificate = f
 		return nil
 	}
 }

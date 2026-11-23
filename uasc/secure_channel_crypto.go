@@ -22,7 +22,12 @@ func (s *SecureChannel) NewSessionSignature(cert, nonce []byte) ([]byte, string,
 	if err != nil {
 		return nil, "", err
 	}
-	remoteKey := remoteX509Cert.PublicKey.(*rsa.PublicKey)
+	// A client chooses the certificate: an unchecked assertion would let a
+	// certificate with another key type panic the server.
+	remoteKey, ok := remoteX509Cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, "", ua.StatusBadCertificateInvalid
+	}
 
 	enc, err := uapolicy.Asymmetric(s.cfg.SecurityPolicyURI, s.cfg.LocalKey, remoteKey)
 	if err != nil {
@@ -48,7 +53,10 @@ func (s *SecureChannel) VerifySessionSignature(cert, nonce, signature []byte) er
 	if err != nil {
 		return err
 	}
-	remoteKey := remoteX509Cert.PublicKey.(*rsa.PublicKey)
+	remoteKey, ok := remoteX509Cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return ua.StatusBadCertificateInvalid
+	}
 
 	enc, err := uapolicy.Asymmetric(s.cfg.SecurityPolicyURI, s.cfg.LocalKey, remoteKey)
 	if err != nil {
@@ -77,7 +85,10 @@ func (s *SecureChannel) EncryptUserPassword(policyURI, password string, cert, no
 	if err != nil {
 		return nil, "", err
 	}
-	remoteKey := remoteX509Cert.PublicKey.(*rsa.PublicKey)
+	remoteKey, ok := remoteX509Cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, "", ua.StatusBadCertificateInvalid
+	}
 
 	enc, err := uapolicy.Asymmetric(policyURI, s.cfg.LocalKey, remoteKey)
 	if err != nil {
@@ -114,7 +125,10 @@ func (s *SecureChannel) NewUserTokenSignature(policyURI string, cert, nonce []by
 	if err != nil {
 		return nil, "", err
 	}
-	remoteKey := remoteX509Cert.PublicKey.(*rsa.PublicKey)
+	remoteKey, ok := remoteX509Cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, "", ua.StatusBadCertificateInvalid
+	}
 
 	enc, err := uapolicy.Asymmetric(policyURI, s.cfg.UserKey, remoteKey)
 	if err != nil {
