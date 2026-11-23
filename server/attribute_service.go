@@ -1,8 +1,10 @@
 package server
 
 import (
+	"fmt"
 	"time"
 
+	"github.com/gopcua/opcua/secevent"
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uasc"
 )
@@ -25,6 +27,21 @@ func (s *AttributeService) Read(sc *uasc.SecureChannel, r ua.Request, reqID uint
 		return nil, err
 	}
 
+	// Enforce the limit the server advertises in its OperationLimits
+	// (OPC 10000-5 §6.3.11): a client that ignores it is either broken
+	// or trying to make the server do unbounded work.
+	if max := s.srv.cfg.cap.OperationalLimits.MaxNodesPerRead; max > 0 && uint32(len(req.NodesToRead)) > max {
+		s.srv.emit(sc, secevent.Event{
+			Kind:      secevent.OversizedRequest,
+			Severity:  secevent.Warning,
+			RequestID: reqID,
+			Service:   "ReadRequest",
+			Status:    ua.StatusBadTooManyOperations,
+			Detail:    fmt.Sprintf("read of %d nodes exceeds MaxNodesPerRead %d", len(req.NodesToRead), max),
+		})
+		return nil, ua.StatusBadTooManyOperations
+	}
+
 	results := make([]*ua.DataValue, len(req.NodesToRead))
 	for i, n := range req.NodesToRead {
 		if s.srv.cfg.logger != nil {
@@ -38,6 +55,16 @@ func (s *AttributeService) Read(sc *uasc.SecureChannel, r ua.Request, reqID uint
 				ServerTimestamp: time.Now(),
 				Status:          ua.StatusBad,
 			}
+			s.srv.emit(sc, secevent.Event{
+				Kind:        secevent.UnknownNode,
+				Severity:    secevent.Warning,
+				RequestID:   reqID,
+				Service:     "ReadRequest",
+				NodeID:      n.NodeID,
+				AttributeID: n.AttributeID,
+				Status:      ua.StatusBad,
+				Detail:      "read in an unknown namespace",
+			})
 			continue
 		}
 		results[i] = ns.Attribute(n.NodeID, n.AttributeID)

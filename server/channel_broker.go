@@ -33,6 +33,10 @@ type channelBroker struct {
 	// get funneled into for handling
 	msgChan chan *uasc.MessageBody
 	logger  Logger
+
+	// configure, if set, adjusts the configuration of each new secure
+	// channel.
+	configure func(*uasc.Config)
 }
 
 func newChannelBroker(logger Logger) *channelBroker {
@@ -52,9 +56,17 @@ func newChannelBroker(logger Logger) *channelBroker {
 // Response channel
 // Blocks until the context is done, the connection closes, or a critical error
 func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, localCert []byte, localKey *rsa.PrivateKey) error {
+	// The broker owns the connection from here on: close it however the
+	// channel ends, so that the socket and its slot in the listener's
+	// connection limits are released.
+	defer conn.Close()
+
 	cfg := defaultChannelConfig()
 	cfg.Certificate = localCert
 	cfg.LocalKey = localKey
+	if c.configure != nil {
+		c.configure(cfg)
+	}
 
 	c.mu.Lock()
 	c.secureChannelID++

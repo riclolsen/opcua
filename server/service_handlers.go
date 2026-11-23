@@ -100,7 +100,7 @@ func (s *Server) RegisterHandler(typeID uint16, h Handler) {
 	}
 }
 
-func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqID uint32, req ua.Request) {
+func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, channelID, reqID uint32, req ua.Request) {
 	if s.cfg.logger != nil {
 		s.cfg.logger.Debug("handleService: Got: %T\n", req)
 	}
@@ -108,10 +108,18 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 	var resp ua.Response
 	var err error
 
+	// Every request keeps its session alive (OPC 10000-4 §5.6.2).
+	if hdr := req.Header(); hdr != nil {
+		s.sb.Touch(hdr.AuthenticationToken)
+	}
+
 	typeID := ua.ServiceTypeID(req)
 	h, ok := s.handlers[typeID]
-	if ok {
+	if refuse := s.auditRequest(sc, channelID, reqID, req); refuse != ua.StatusOK {
+		err = refuse
+	} else if ok {
 		resp, err = h(sc, req, reqID)
+		s.auditResponse(sc, reqID, req, resp, err)
 	} else {
 		if typeID == 0 {
 			if s.cfg.logger != nil {
@@ -119,6 +127,7 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 			}
 		}
 		err = ua.StatusBadServiceUnsupported
+		s.auditResponse(sc, reqID, req, nil, err)
 	}
 
 	if err != nil {

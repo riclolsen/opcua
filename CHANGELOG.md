@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+* secevent: report security events (connections, rejected certificates,
+  malformed and oversized messages, sequence errors, unknown nodes and
+  services, type mismatches, writes, method calls, floods, connection
+  exhaustion, MAC address changes, unsolicited responses) to a callback with
+  `server.SecurityEventHandler` and `opcua.SecurityEventHandler`
+* expose the peer's MAC address: `uacp.Conn.RemoteMAC`,
+  `uasc.SecureChannel.RemoteMAC`, `Client.RemoteMAC`
+* server: options `AllowedPeers`, `MaxConnections`, `ConnectionRateLimit`,
+  `HandshakeTimeout`, `MaxPendingHandshakes`, `RequestRateLimit`,
+  `AddressScanLimit`, `RenewRateLimit`, `MaxSessions`, `CertificateValidator`,
+  `MaxNodesPerRead`; client option `RemoteCertificateValidator`
+* uacp: `Listener.Accept` no longer returns the error of a client that fails
+  the handshake; handshakes run concurrently, bounded by a timeout (10s) and a
+  limit of pending handshakes (128). A client that connected and stayed silent
+  blocked every later connection, and one that reset its connection during
+  the handshake stopped the server's accept loop
+* server: enforce the advertised `MaxNodesPerRead`; reject writes whose value
+  does not match a built-in DataType with `Bad_TypeMismatch`
+* uasc: reject a secure channel renewal that changes the security policy, the
+  security mode or the peer certificate; reject a SecurityMode that does not
+  fit the policy; bound the chunks and bytes buffered for all partial
+  messages together; reject
+  invalid chunk types
+* fix panics on certificates without an RSA key and on truncated signed chunks
+* server: expire sessions that receive no request within their revised
+  session timeout (OPC 10000-4 §5.6.2); close the connection of a secure
+  channel that ended
+* client: reject an OpenSecureChannel response whose server certificate is
+  not the endpoint's
+
 ## v0.8.0 (24 Apr 2025)
 
 * add DialTimeout and cleanup ResolveEndpoint (#372)

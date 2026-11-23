@@ -15,6 +15,7 @@ import (
 
 	"github.com/gopcua/opcua/debug"
 	"github.com/gopcua/opcua/errors"
+	"github.com/gopcua/opcua/secevent"
 	"github.com/gopcua/opcua/ua"
 )
 
@@ -64,6 +65,16 @@ type Dialer struct {
 	// ClientACK defines the connection parameters requested by the client.
 	// Defaults to DefaultClientACK.
 	ClientACK *Acknowledge
+
+	// Events receives the security events of the connections the dialer
+	// establishes. Optional.
+	Events secevent.Handler
+
+	// MACs, when set together with Events, remembers the MAC address of
+	// every server the dialer connects to and reports a
+	// secevent.MACChanged event when a later connection to the same IP
+	// address reaches a different MAC address.
+	MACs *secevent.MACTracker
 }
 
 func (d *Dialer) Dial(ctx context.Context, endpoint string) (*Conn, error) {
@@ -94,6 +105,19 @@ func (d *Dialer) Dial(ctx context.Context, endpoint string) (*Conn, error) {
 		c.Close()
 		return nil, err
 	}
+	conn.events = d.Events
+	if d.Events != nil && d.MACs != nil {
+		if mac, err := conn.RemoteMAC(); err == nil {
+			if prev, changed := d.MACs.Observe(conn.TCPConn.RemoteAddr().(*net.TCPAddr).IP, mac); changed {
+				conn.Emit(secevent.Event{
+					Kind:        secevent.MACChanged,
+					Severity:    secevent.Alert,
+					PreviousMAC: prev,
+					Detail:      "server IP address reached through a different MAC address",
+				})
+			}
+		}
+	}
 
 	debug.Printf("uacp %d: start HEL/ACK handshake", conn.id)
 	if err := conn.Handshake(ctx, endpoint); err != nil {
@@ -110,77 +134,22 @@ func Dial(ctx context.Context, endpoint string) (*Conn, error) {
 	return d.Dial(ctx, endpoint)
 }
 
-// Listener is a OPC UA Connection Protocol network listener.
-type Listener struct {
-	l        *net.TCPListener
-	ack      *Acknowledge
-	endpoint string
-}
-
-// Listen acts like net.Listen for OPC UA Connection Protocol networks.
-//
-// Currently the endpoint can only be specified in "opc.tcp://<addr[:port]>/path" format.
-//
-// If the IP field of laddr is nil or an unspecified IP address, Listen listens
-// on all available unicast and anycast IP addresses of the local system.
-// If the Port field of laddr is 0, a port number is automatically chosen.
-func Listen(ctx context.Context, endpoint string, ack *Acknowledge) (*Listener, error) {
-	if ack == nil {
-		ack = DefaultServerACK
-	}
-	_, laddr, err := ResolveEndpoint(ctx, endpoint)
-	if err != nil {
-		return nil, err
-	}
-
-	var lc net.ListenConfig
-	l, err := lc.Listen(ctx, "tcp", laddr.Host)
-	if err != nil {
-		return nil, err
-	}
-	return &Listener{
-		l:        l.(*net.TCPListener),
-		ack:      ack,
-		endpoint: endpoint,
-	}, nil
-}
-
-// Accept accepts the next incoming call and returns the new connection.
-//
-// The first param ctx is to be passed to monitor(), which monitors and handles
-// incoming messages automatically in another goroutine.
-func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
-	c, err := l.l.AcceptTCP()
-	if err != nil {
-		return nil, err
-	}
-	conn := &Conn{TCPConn: c, id: nextid(), ack: l.ack}
-	if err := conn.srvhandshake(l.endpoint); err != nil {
-		c.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-
-// Close closes the Listener.
-func (l *Listener) Close() error {
-	return l.l.Close()
-}
-
-// Addr returns the listener's network address.
-func (l *Listener) Addr() net.Addr {
-	return l.l.Addr()
-}
-
-// Endpoint returns the listener's EndpointURL.
-func (l *Listener) Endpoint() string {
-	return l.endpoint
-}
-
 type Conn struct {
 	*net.TCPConn
 	id  uint32
 	ack *Acknowledge
+
+	// events receives the security events of the connection.
+	events secevent.Handler
+
+	// mac caches the result of the MAC address lookup of the peer.
+	macOnce sync.Once
+	mac     net.HardwareAddr
+	macErr  error
+
+	// release is called once when the connection closes, to return its
+	// slot to the listener's connection limits.
+	release func()
 
 	closeOnce sync.Once
 }
@@ -223,7 +192,57 @@ func (c *Conn) Close() (err error) {
 
 func (c *Conn) close() error {
 	debug.Printf("uacp %d: close", c.id)
+	if c.release != nil {
+		c.release()
+	}
 	return c.TCPConn.Close()
+}
+
+// SetEventHandler sets the handler for the security events of the
+// connection. It must be called before the connection is used.
+func (c *Conn) SetEventHandler(h secevent.Handler) {
+	c.events = h
+}
+
+// EventHandler returns the handler for the security events of the
+// connection, which may be nil.
+func (c *Conn) EventHandler() secevent.Handler {
+	return c.events
+}
+
+// RemoteMAC returns the MAC address of the peer, looked up in the operating
+// system's neighbor table once per connection. It returns
+// secevent.ErrMACUnavailable when the peer is not on a directly attached
+// network or the platform does not support the lookup.
+func (c *Conn) RemoteMAC() (net.HardwareAddr, error) {
+	c.macOnce.Do(func() {
+		if c.mac == nil && c.macErr == nil {
+			c.mac, c.macErr = secevent.LookupAddrMAC(c.TCPConn.RemoteAddr())
+		}
+	})
+	return c.mac, c.macErr
+}
+
+// Emit reports a security event of the connection, filling in the
+// addresses, the MAC address of the peer and the connection id. It is a
+// no-op when the connection has no event handler.
+func (c *Conn) Emit(e secevent.Event) {
+	if c == nil || c.events == nil {
+		return
+	}
+	if e.Local == nil {
+		e.Local = c.TCPConn.LocalAddr()
+	}
+	if e.Remote == nil {
+		e.Remote = c.TCPConn.RemoteAddr()
+	}
+	if e.RemoteMAC == nil {
+		e.RemoteMAC, _ = c.RemoteMAC()
+	}
+	if e.ConnID == 0 {
+		e.ConnID = c.id
+	}
+	c.events.Emit(e)
 }
 
 // Handshake sends Hello and waits for Acknowledge, bounded by ctx: by its
@@ -308,7 +327,9 @@ func (c *Conn) handshake(ctx context.Context, endpoint string) error {
 	}
 }
 
-func (c *Conn) srvhandshake(endpoint string) error {
+// srvhandshake runs the server side of the handshake. deadline bounds the
+// whole handshake, including the connection a ReverseHello asks for.
+func (c *Conn) srvhandshake(endpoint string, deadline time.Time) error {
 	b, err := c.Receive()
 	if err != nil {
 		c.SendError(ua.StatusBadTCPInternalError)
@@ -322,8 +343,17 @@ func (c *Conn) srvhandshake(endpoint string) error {
 	case "HELF":
 		hel := new(Hello)
 		if _, err := hel.Decode(msg); err != nil {
+			c.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Detail: "invalid Hello", Err: err})
 			c.SendError(ua.StatusBadTCPInternalError)
 			return err
+		}
+		// OPC 10000-6 §7.1.2.3: the EndpointUrl "shall be less than 4096
+		// bytes"; a server rejects a longer one with
+		// Bad_TcpEndpointUrlInvalid.
+		if len(hel.EndpointURL) >= maxEndpointURLLength {
+			c.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Status: ua.StatusBadTCPEndpointURLInvalid, Detail: fmt.Sprintf("Hello EndpointUrl of %d bytes", len(hel.EndpointURL))})
+			c.SendError(ua.StatusBadTCPEndpointURLInvalid)
+			return errors.Errorf("uacp: endpoint url too long: %d bytes", len(hel.EndpointURL))
 		}
 		// TODO (dh): Temporarily disabled until a proper fix can be implemented.
 		// Problem is that when listening on a random port, (eg. :0), this check fails
@@ -341,21 +371,29 @@ func (c *Conn) srvhandshake(endpoint string) error {
 	case "RHEF":
 		rhe := new(ReverseHello)
 		if _, err := rhe.Decode(msg); err != nil {
+			c.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Detail: "invalid ReverseHello", Err: err})
 			c.SendError(ua.StatusBadTCPInternalError)
 			return err
 		}
+		c.Emit(secevent.Event{Kind: secevent.ReverseHello, Severity: secevent.Notice, Detail: fmt.Sprintf("ReverseHello from ServerUri %q for EndpointUrl %q", rhe.ServerURI, rhe.EndpointURL)})
 		if rhe.EndpointURL != endpoint {
 			c.SendError(ua.StatusBadTCPEndpointURLInvalid)
 			return errors.Errorf("uacp: invalid endpoint url %s", rhe.EndpointURL)
 		}
 		debug.Printf("uacp %d: connecting to %s", c.id, rhe.ServerURI)
-		c.Close()
-		var dialer net.Dialer
+		// Close the socket only: Close would mark the Conn closed and
+		// release its listener slot while it carries on over c2.
+		c.TCPConn.Close()
+		dialer := net.Dialer{Deadline: deadline}
 		c2, err := dialer.DialContext(context.Background(), "tcp", rhe.ServerURI)
 		if err != nil {
 			return err
 		}
 		c.TCPConn = c2.(*net.TCPConn)
+		// The peer is now another host: forget the MAC address looked up
+		// for the old one.
+		c.macOnce = sync.Once{}
+		c.mac, c.macErr = nil, nil
 		debug.Printf("uacp %d: recv %#v", c.id, rhe)
 		return nil
 
@@ -376,6 +414,11 @@ func (c *Conn) srvhandshake(endpoint string) error {
 // hdrlen is the size of the uacp header
 const hdrlen = 8
 
+// maxEndpointURLLength bounds the EndpointUrl of a Hello, which "shall be
+// less than 4096 bytes"
+// (OPC 10000-6 §7.1.2.3).
+const maxEndpointURLLength = 4096
+
 // Receive reads a full UACP message from the underlying connection.
 // The size of b must be at least ReceiveBufSize. Otherwise,
 // the function returns an error.
@@ -392,14 +435,26 @@ func (c *Conn) Receive() ([]byte, error) {
 
 	var h Header
 	if _, err := h.Decode(b[:hdrlen]); err != nil {
-		return nil, errors.Errorf("uacp: header decode failed: %s", err)
+		err = errors.Errorf("uacp: header decode failed: %s", err)
+		c.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Detail: "invalid uacp header", Err: err})
+		return nil, err
+	}
+
+	if !validMessageType(h.MessageType, h.ChunkType) {
+		err := errors.Errorf("uacp: invalid message type %q, chunk type %q: %w", h.MessageType, h.ChunkType, ua.StatusBadTCPMessageTypeInvalid)
+		c.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Status: ua.StatusBadTCPMessageTypeInvalid, Detail: "invalid message type", Err: err})
+		return nil, err
 	}
 
 	if h.MessageSize > c.ack.ReceiveBufSize {
-		return nil, errors.Errorf("uacp: message too large: %d > %d bytes. MsgType=%s, ChunkType=%c", h.MessageSize, c.ack.ReceiveBufSize, h.MessageType, h.ChunkType)
+		err := errors.Errorf("uacp: message too large: %d > %d bytes. MsgType=%s, ChunkType=%c", h.MessageSize, c.ack.ReceiveBufSize, h.MessageType, h.ChunkType)
+		c.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, Status: ua.StatusBadTCPMessageTooLarge, Detail: fmt.Sprintf("message of %d bytes exceeds receive buffer of %d bytes", h.MessageSize, c.ack.ReceiveBufSize), Err: err})
+		return nil, err
 	}
 	if h.MessageSize < hdrlen {
-		return nil, errors.Errorf("uacp: message too small: %d bytes. MsgType=%s, ChunkType=%c.", h.MessageSize, h.MessageType, h.ChunkType)
+		err := errors.Errorf("uacp: message too small: %d bytes. MsgType=%s, ChunkType=%c.", h.MessageSize, h.MessageType, h.ChunkType)
+		c.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Detail: "message size smaller than header", Err: err})
+		return nil, err
 	}
 
 	if _, err := io.ReadFull(c, b[hdrlen:h.MessageSize]); err != nil {
@@ -413,11 +468,27 @@ func (c *Conn) Receive() ([]byte, error) {
 	if h.MessageType == "ERR" {
 		errf := new(Error)
 		if _, err := errf.Decode(b[hdrlen:h.MessageSize]); err != nil {
-			return nil, errors.Errorf("uacp: failed to decode ERRF message: %s", err)
+			err = errors.Errorf("uacp: failed to decode ERRF message: %s", err)
+			c.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Detail: "invalid ERR message", Err: err})
+			return nil, err
 		}
 		return nil, errf
 	}
 	return b[:h.MessageSize], nil
+}
+
+// validMessageType reports whether typ and chunk form a message type of
+// OPC 10000-6 §7.1.2 and §6.7.2: the connection protocol messages are
+// single, final chunks; the secure conversation messages are final ('F'),
+// intermediate ('C') or abort ('A') chunks.
+func validMessageType(typ string, chunk byte) bool {
+	switch typ {
+	case "HEL", "ACK", "ERR", "RHE":
+		return chunk == 'F'
+	case "MSG", "OPN", "CLO":
+		return chunk == 'F' || chunk == 'C' || chunk == 'A'
+	}
+	return false
 }
 
 func (c *Conn) Send(typ string, msg interface{}) error {
