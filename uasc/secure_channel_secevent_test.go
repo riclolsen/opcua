@@ -172,37 +172,29 @@ func TestCertificateValidatorRejects(t *testing.T) {
 	require.ErrorIs(t, s.checkRemoteCertificate(1, cert, nil), ua.StatusBadCertificateUntrusted)
 }
 
-// Partial messages of many RequestIds together are bounded by the chunk
-// count, not only each one: a peer that starts messages and never finishes
-// them cannot grow the buffer without bound.
+// Partial messages of many RequestIds together are bounded by
+// maxUnfinishedMessages: a peer that starts messages and never finishes them
+// cannot grow the buffer without bound.
 func TestPartialMessagesAreBoundedAcrossRequests(t *testing.T) {
 	s, peer := newSequenceNumberTestChannel(t)
+	s.kind = server
 	rec := &eventRecorder{}
 	s.c.SetEventHandler(rec.handle)
 	s.chunks = make(map[uint32][]*MessageChunk)
 
-	max := int(s.c.MaxChunkCount())
 	// The socket buffers all of them: each chunk is a few dozen bytes.
-	for i := 0; i <= max; i++ {
+	for i := 0; i <= maxUnfinishedMessages; i++ {
 		peer.writeChunk(t, ChunkTypeIntermediate, uint32(i+1), uint32(i+1))
 	}
 
 	msg := s.Receive(context.Background())
 	require.Error(t, msg.Err)
-	require.Contains(t, msg.Err.Error(), "too many buffered chunks")
+	require.Contains(t, msg.Err.Error(), "too many unfinished messages")
 	_, ok := rec.find(secevent.OversizedMessage)
 	require.True(t, ok)
 
 	s.chunksMu.Lock()
 	defer s.chunksMu.Unlock()
-	n := 0
-	var bytes uint64
-	for _, cs := range s.chunks {
-		n += len(cs)
-		for _, c := range cs {
-			bytes += uint64(len(c.Data))
-		}
-	}
-	require.Equal(t, n, s.chunkCount, "accounting matches the buffer")
-	require.Equal(t, bytes, s.chunkBytes)
+	require.Empty(t, s.chunks)
+	require.Empty(t, s.chunkBytes)
 }

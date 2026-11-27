@@ -7,6 +7,7 @@ package uasc
 import (
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gopcua/opcua/debug"
@@ -34,7 +35,7 @@ type channelInstance struct {
 	algo            *uapolicy.EncryptionAlgorithm
 	maxBodySize     uint32
 
-	bytesSent uint64 // atomic.Load/Store - needs to be aligned for 32bit systems
+	bytesSent atomic.Uint64 // always 64-bit aligned, also on 32bit systems
 	// bytesReceived    uint64
 	messagesSent uint32 // atomic.Load/Store
 	// messagesReceived uint32
@@ -281,11 +282,14 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 		b = append(b[:headerLength], p...)
 	}
 
-	// A chunk too short for its headers and signature, or with a padding
-	// length beyond its body, would make the slicing below panic.
 	if len(b) < headerLength+c.algo.RemoteSignatureLength() {
+		// OPC 10000-6 §6.7.7: "The contents of the MessageChunk shall not be
+		// interpreted until the Message is decrypted and the signature and
+		// sequence number verified." A chunk without room for the signature
+		// cannot validate it.
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
+
 	signature := b[len(b)-c.algo.RemoteSignatureLength():]
 	messageToVerify := b[:len(b)-c.algo.RemoteSignatureLength()]
 
@@ -304,7 +308,11 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 		paddingLength += 1
 	}
 
-	if paddingLength < 0 || headerLength > len(messageToVerify)-paddingLength {
+	// The padding fills the chunk to a block boundary (OPC 10000-6 §6.7.2.5),
+	// so it can never be longer than the body it pads. A PaddingSize that
+	// says otherwise fails the security check instead of slicing past the
+	// start of the body.
+	if paddingLength > len(messageToVerify)-headerLength {
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 	b = messageToVerify[headerLength : len(messageToVerify)-paddingLength]

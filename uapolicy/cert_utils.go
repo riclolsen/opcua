@@ -8,10 +8,16 @@ import (
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
+	"errors"
 	"fmt"
 
 	"github.com/gopcua/opcua/debug"
 )
+
+// ErrNotRSA is returned when a certificate holds no RSA public key, which
+// none of the SecurityPolicies this package implements can use: OPC 10000-7
+// requires their asymmetric algorithms to be RSA based.
+var ErrNotRSA = errors.New("uapolicy: certificate contains no RSA public key")
 
 // Thumbprint returns the thumbprint of the first DER-encoded certificate.
 // If c contains a certificate chain, only the first (leaf) certificate is used.
@@ -47,7 +53,8 @@ func ParseCertificate(c []byte) (*x509.Certificate, error) {
 	return certs[0], nil
 }
 
-// PublicKey returns the RSA PublicKey from a DER-encoded certificate
+// PublicKey returns the RSA PublicKey from a DER-encoded certificate.
+// It returns ErrNotRSA if the certificate holds no RSA public key.
 func PublicKey(c []byte) (*rsa.PublicKey, error) {
 	cert, err := ParseCertificate(c)
 	if err != nil {
@@ -56,7 +63,7 @@ func PublicKey(c []byte) (*rsa.PublicKey, error) {
 
 	key, ok := cert.PublicKey.(*rsa.PublicKey)
 	if !ok {
-		return nil, fmt.Errorf("uapolicy: certificate has a %T, not an RSA public key", cert.PublicKey)
+		return nil, fmt.Errorf("%w: %T", ErrNotRSA, cert.PublicKey)
 	}
 	return key, nil
 }

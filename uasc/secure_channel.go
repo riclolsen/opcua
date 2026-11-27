@@ -56,6 +56,11 @@ const (
 	server
 )
 
+// maxUnfinishedMessages is the per-channel cap on request ids with an
+// unfinished message, i.e. buffered intermediate chunks. A conforming
+// peer has one unfinished message at a time: OPC 10000-6 §6.7.3.
+const maxUnfinishedMessages = 8
+
 // ResponseHandler handles the response of a service request and
 // is used by the client.
 type ResponseHandler func(ua.Response) error
@@ -211,12 +216,13 @@ type SecureChannel struct {
 	handlers   map[uint32]chan *MessageBody
 	handlersMu sync.Mutex
 
-	// chunks maintains a temporary list of chunks for a given request ID
-	chunks   map[uint32][]*MessageChunk
-	chunksMu sync.Mutex
-	// chunkCount and chunkBytes account for all chunks in chunks.
-	chunkCount int
-	chunkBytes uint64
+	// chunks buffers the chunks of unfinished messages, keyed by request
+	// ID. A buffered chunk holds a copy of its own data. chunkBytes is
+	// the body bytes buffered for that request ID. See maxUnfinishedMessages
+	// and maxMessageSize for the bounds on both maps.
+	chunks     map[uint32][]*MessageChunk
+	chunkBytes map[uint32]uint64
+	chunksMu   sync.Mutex
 
 	// recvSequence is the SequenceNumber of the last received chunk, whatever
 	// TokenId secured it (OPC 10000-6 §6.7.2.4: the SequenceNumber "does not
@@ -334,6 +340,7 @@ func newSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, kind channelKi
 		disconnected: make(chan struct{}),
 		instances:    make(map[uint32][]*channelInstance),
 		chunks:       make(map[uint32][]*MessageChunk),
+		chunkBytes:   make(map[uint32]uint64),
 		handlers:     make(map[uint32]chan *MessageBody),
 	}
 
@@ -504,7 +511,7 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 
 			switch hdr.ChunkType {
 			case 'A':
-				s.dropChunks(reqID)
+				s.deleteChunksLocked(reqID)
 				s.chunksMu.Unlock()
 
 				msga := new(MessageAbort)
@@ -518,38 +525,57 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 				return &MessageBody{RequestID: reqID, Err: ua.StatusCode(msga.ErrorCode)}
 
 			case 'C':
-				// The chunk's data is a slice of a buffer sized for a
-				// whole receive buffer; copy it so that what is retained
-				// is what is counted.
+				// A client only receives chunks for requests it sent
+				// (OPC 10000-6 §6.7.2.4); drop the rest.
+				if s.kind == client && !s.hasHandler(reqID) {
+					debug.Printf("uasc %d/%d: dropping chunk for unknown request id", s.c.ID(), reqID)
+					s.chunksMu.Unlock()
+					continue
+				}
+
+				// Copy the chunk's data: it was decoded from a shared receive buffer.
 				chunk.Data = append([]byte(nil), chunk.Data...)
+
+				// Create the per-channel state on first use: a zero-value
+				// SecureChannel has nil maps, and writing to a nil map panics.
+				if s.chunks == nil {
+					s.chunks = make(map[uint32][]*MessageChunk)
+				}
+				if s.chunkBytes == nil {
+					s.chunkBytes = make(map[uint32]uint64)
+				}
+
+				// A message's buffered chunks are capped at its negotiated
+				// MaxMessageSize of body bytes (OPC 10000-6 §7.1.2.4);
+				// see maxMessageSize.
+				msgBytes := s.chunkBytes[reqID] + uint64(len(chunk.Data))
+				if msgBytes > uint64(s.maxMessageSize()) {
+					s.deleteChunksLocked(reqID)
+					s.chunksMu.Unlock()
+					msg.Err = errors.Errorf("too many chunk bytes for request id %d: %d > %d", reqID, msgBytes, s.maxMessageSize())
+					s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "message chunks exceed the maximum message size", Err: msg.Err})
+					return msg
+				}
+
+				// A conforming peer has one unfinished message at a time
+				// (§6.7.3, see maxUnfinishedMessages); refuse request ids
+				// beyond the cap instead of buffering them.
+				if _, ok := s.chunks[reqID]; !ok && len(s.chunks) >= maxUnfinishedMessages {
+					n := len(s.chunks) + 1
+					s.clearChunksLocked()
+					s.chunksMu.Unlock()
+					msg.Err = errors.Errorf("too many unfinished messages: %d > %d", n, maxUnfinishedMessages)
+					s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "too many unfinished messages", Err: msg.Err})
+					return msg
+				}
+
 				s.chunks[reqID] = append(s.chunks[reqID], chunk)
-				s.chunkCount++
-				s.chunkBytes += uint64(len(chunk.Data))
+				s.chunkBytes[reqID] = msgBytes
 				if n := len(s.chunks[reqID]); uint32(n) > s.c.MaxChunkCount() {
-					s.dropChunks(reqID)
+					s.deleteChunksLocked(reqID)
 					s.chunksMu.Unlock()
 					msg.Err = errors.Errorf("too many chunks: %d > %d", n, s.c.MaxChunkCount())
 					s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "too many chunks", Err: msg.Err})
-					return msg
-				}
-				// Bound what all partial messages together hold, not
-				// only each one: a peer that starts many messages and
-				// never finishes them would otherwise hold MaxChunkCount
-				// chunks for every RequestId it invents.
-				if max := s.c.MaxChunkCount(); max > 0 && uint64(s.chunkCount) > uint64(max) {
-					n := s.chunkCount
-					s.dropChunks(reqID)
-					s.chunksMu.Unlock()
-					msg.Err = errors.Errorf("too many buffered chunks: %d > %d", n, max)
-					s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "buffered partial messages exceed the maximum chunk count", Err: msg.Err})
-					return msg
-				}
-				if max := s.c.MaxMessageSize(); max > 0 && s.chunkBytes > uint64(max) {
-					n := s.chunkBytes
-					s.dropChunks(reqID)
-					s.chunksMu.Unlock()
-					msg.Err = errors.Errorf("partial messages too large: %d > %d", n, max)
-					s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "buffered partial messages exceed the maximum message size", Err: msg.Err})
 					return msg
 				}
 				s.chunksMu.Unlock()
@@ -565,7 +591,7 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 
 			// merge chunks
 			all := append(s.chunks[reqID], chunk)
-			s.dropChunks(reqID)
+			s.deleteChunksLocked(reqID)
 
 			s.chunksMu.Unlock()
 
@@ -576,8 +602,8 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 				return msg
 			}
 
-			if uint32(len(b)) > s.c.MaxMessageSize() {
-				msg.Err = errors.Errorf("message too large: %d > %d", uint32(len(b)), s.c.MaxMessageSize())
+			if uint32(len(b)) > s.maxMessageSize() {
+				msg.Err = errors.Errorf("message too large: %d > %d", uint32(len(b)), s.maxMessageSize())
 				s.Emit(secevent.Event{Kind: secevent.OversizedMessage, Severity: secevent.Warning, RequestID: reqID, Status: ua.StatusBadRequestTooLarge, Detail: "message exceeds the maximum message size", Err: msg.Err})
 				return msg
 			}
@@ -635,10 +661,44 @@ func (s *SecureChannel) Receive(ctx context.Context) *MessageBody {
 	}
 }
 
+// deleteChunksLocked discards the chunks buffered for reqID and releases
+// the bytes they hold. The caller must hold chunksMu.
+func (s *SecureChannel) deleteChunksLocked(reqID uint32) {
+	delete(s.chunks, reqID)
+	delete(s.chunkBytes, reqID)
+}
+
+// clearChunksLocked discards every buffered chunk of every unfinished
+// message. The caller must hold chunksMu.
+func (s *SecureChannel) clearChunksLocked() {
+	s.chunks = make(map[uint32][]*MessageChunk)
+	s.chunkBytes = make(map[uint32]uint64)
+}
+
+// maxMessageSize is the byte limit for a single message: the MaxMessageSize
+// the connection negotiated, or the uacp default when the peer set none.
+// MaxMessageSize is a UInt32 (OPC 10000-6 §7.1.2.4 Table 75), so every
+// comparison against it happens in uint32/uint64, never int, which
+// overflows to a negative number on 32-bit platforms for 2^31 and above.
+func (s *SecureChannel) maxMessageSize() uint32 {
+	if n := s.c.MaxMessageSize(); n > 0 {
+		return n
+	}
+	return uacp.DefaultMaxMessageSize
+}
+
+// hasHandler reports whether a response handler is registered for reqID,
+// i.e. whether the client has a request with that id in flight.
+func (s *SecureChannel) hasHandler(reqID uint32) bool {
+	s.handlersMu.Lock()
+	defer s.handlersMu.Unlock()
+	return s.handlers[reqID] != nil
+}
+
 func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	// read a full message from the underlying conn.
 	b, err := s.c.Receive()
-	if err == io.EOF || len(b) == 0 {
+	if err == io.EOF || (err == nil && len(b) == 0) {
 		return nil, io.EOF
 	}
 	// do not wrap this error since it hides conn error
@@ -652,8 +712,11 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 
 	const hdrlen = 12 // TODO: move to pkg level const
 	if len(b) < hdrlen {
-		err := errors.Errorf("sechan: message of %d bytes is shorter than its header", len(b))
-		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Detail: "truncated secure conversation header", Err: err})
+		// uacp only guarantees its eight byte transport header, so a
+		// chunk shorter than hdrlen has no secure conversation header
+		// (OPC 10000-6 §6.7.2) and cannot be decoded.
+		err := errors.Errorf("sechan: message of %d bytes is shorter than its header: %w", len(b), ua.StatusBadDecodingError)
+		s.Emit(secevent.Event{Kind: secevent.MalformedMessage, Severity: secevent.Warning, Status: ua.StatusBadDecodingError, Detail: "truncated secure conversation header", Err: err})
 		return nil, err
 	}
 	h := new(Header)
@@ -1483,7 +1546,7 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 		}
 		s.c.SetWriteDeadline(time.Time{})
 
-		atomic.AddUint64(&instance.bytesSent, uint64(n))
+		instance.bytesSent.Add(uint64(n))
 		atomic.AddUint32(&instance.messagesSent, 1)
 
 		debug.Printf("uasc %d/%d: send %T with %d bytes", s.c.ID(), reqID, req, len(chunk))
@@ -1542,7 +1605,7 @@ func (s *SecureChannel) writeMessageChunks(ctx context.Context, instance *channe
 		}
 
 		bytesSent += n
-		atomic.AddUint64(&instance.bytesSent, uint64(n))
+		instance.bytesSent.Add(uint64(n))
 		atomic.AddUint32(&instance.messagesSent, 1)
 	}
 
@@ -1679,16 +1742,6 @@ func (s *SecureChannel) timeNow() time.Time {
 		return s.time()
 	}
 	return time.Now()
-}
-
-// dropChunks forgets the buffered chunks of reqID and their accounting.
-// The caller holds chunksMu.
-func (s *SecureChannel) dropChunks(reqID uint32) {
-	for _, c := range s.chunks[reqID] {
-		s.chunkCount--
-		s.chunkBytes -= uint64(len(c.Data))
-	}
-	delete(s.chunks, reqID)
 }
 
 // mergeChunks concatenates the bodies of a message's chunks. Chunks reach it
